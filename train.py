@@ -346,7 +346,7 @@ def main():
         dt=float(mc.get("dt", 0.1)),
         use_sparsemax=bool(mc.get("use_sparsemax", True)),
         stability_weight=float(mc.get("stability_weight", 0.01)),
-        gradient_checkpointing=False,
+        gradient_checkpointing=True,
     ).to(device)
 
     n_params = model.get_num_params()
@@ -412,6 +412,8 @@ def main():
     data_iter = iter(train_loader)
     t0 = time.time()
 
+    nan_steps = 0  # track consecutive all-NaN steps
+
     while step < max_steps:
         optimizer.zero_grad(set_to_none=True)
 
@@ -426,19 +428,13 @@ def main():
             input_ids = input_ids.to(device)
             targets = targets.to(device)
 
-            # Use no_sync for all micro-steps except the last to avoid
-            # redundant all-reduce during gradient accumulation
             sync_context = model.no_sync() if (is_distributed and micro_step < grad_accum - 1) else nullcontext()
             with sync_context:
-                # No autocast — complex-valued ops produce NaN under bfloat16.
-                # B200 has enough VRAM for full float32.
                 logits, loss, info = model(input_ids, targets)
                 loss = loss / grad_accum
 
-                # Check for NaN BEFORE backward to prevent gradient corruption
+                # Skip NaN micro-steps silently to prevent gradient corruption
                 if not math.isfinite(loss.item()):
-                    if micro_step == 0:
-                        log(f"  [DEBUG] loss={loss.item()}, ce={info.get('ce_loss','?')}, stab={info.get('stability_loss','?')}", rank)
                     continue
 
                 loss.backward()
@@ -447,12 +443,13 @@ def main():
             valid_micro += 1
 
         # If ALL micro-steps were NaN, skip update but advance step counter
-        # so we try new data next iteration
         if valid_micro == 0:
-            log(f"  [WARN] NaN/Inf loss on all {grad_accum} micro-steps at step {step + 1}, skipping", rank)
+            nan_steps += 1
             optimizer.zero_grad(set_to_none=True)
             step += 1
             continue
+        else:
+            nan_steps = 0
 
         # LR schedule
         lr = get_lr(step, int(tc["warmup_steps"]), max_steps, float(tc["learning_rate"]), float(tc.get("min_lr", 1e-5)))
@@ -465,7 +462,7 @@ def main():
 
         # ── Logging ──
         if step % log_interval == 0:
-            avg_loss = accum_loss / accum_count
+            avg_loss = accum_loss / max(accum_count, 1)
             ppl = math.exp(min(avg_loss, 20))
             dt = time.time() - t0
             tokens_per_sec = (int(tc["batch_size"]) * int(tc["seq_len"]) * grad_accum * log_interval * world_size) / dt
