@@ -2,13 +2,54 @@
 Interactive chat with a trained Resonance Network.
 
 Usage:
-    python chat.py --checkpoint checkpoints/checkpoint_100000.pt
+    python chat.py --checkpoint /workspace/checkpoints/sft/inference_model.pt
+    python chat.py --checkpoint /workspace/checkpoints/sft/latest
 """
 
+import sys
 import argparse
+from pathlib import Path
+
 import torch
 from resonance.model.resonance_network import ResonanceNetwork
 from resonance.generate import generate
+
+
+def find_checkpoint(checkpoint_path: str) -> Path:
+    """Resolve checkpoint path, handling 'latest' markers and directories."""
+    path = Path(checkpoint_path)
+
+    # Direct .pt file
+    if path.is_file() and path.suffix == ".pt":
+        return path
+
+    # "latest" marker file -> read actual checkpoint directory
+    if path.name == "latest" and path.is_file():
+        path = Path(path.read_text().strip())
+
+    # Directory: look for inference_model.pt in it or parent
+    if path.is_dir():
+        candidates = [
+            path / "inference_model.pt",
+            path.parent / "inference_model.pt",
+            path / "checkpoint.pt",
+        ]
+        for c in candidates:
+            if c.is_file():
+                return c
+
+    # Parent directory might have inference_model.pt
+    if path.parent.is_dir():
+        inference = path.parent / "inference_model.pt"
+        if inference.is_file():
+            return inference
+
+    print(f"ERROR: No checkpoint found at '{checkpoint_path}'")
+    print(f"Expected one of:")
+    print(f"  - A .pt file directly")
+    print(f"  - A directory containing inference_model.pt")
+    print(f"  - A 'latest' file pointing to a checkpoint directory")
+    sys.exit(1)
 
 
 def main():
@@ -22,8 +63,9 @@ def main():
     args = parser.parse_args()
 
     # Load checkpoint
-    print("Loading model...")
-    ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
+    ckpt_path = find_checkpoint(args.checkpoint)
+    print(f"Loading model from {ckpt_path}...")
+    ckpt = torch.load(str(ckpt_path), map_location=args.device, weights_only=False)
     config = ckpt["config"]["model"]
 
     model = ResonanceNetwork(
@@ -36,7 +78,7 @@ def main():
         num_stored_patterns=config.get("num_stored_patterns", 256),
         hopfield_steps=config.get("hopfield_steps", 1),
         mag_expansion=config.get("mag_expansion", 4),
-        dropout=0.0,  # no dropout at inference
+        dropout=0.0,
         dt=config.get("dt", 0.1),
         use_sparsemax=config.get("use_sparsemax", False),
         stability_weight=0.0,
@@ -61,9 +103,12 @@ def main():
         if not prompt:
             continue
 
+        # Format as chat prompt for SFT-trained model
+        chat_prompt = f"User: {prompt}\nAssistant:"
+
         output = generate(
             model,
-            prompt,
+            chat_prompt,
             max_new_tokens=args.max_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
@@ -71,8 +116,8 @@ def main():
             device=args.device,
         )
 
-        # Print only the generated part (after prompt)
-        response = output[len(prompt):]
+        # Print only the assistant response
+        response = output[len(chat_prompt):].strip()
         print(f"Model: {response}\n")
 
 

@@ -40,4 +40,4 @@ torchrun --nproc_per_node=4 \
     --save-every 50 --keep-checkpoints 3 \
     --wandb --wandb-project resonance-1b-sft
 
-echo "DONE! python chat.py --checkpoint $CKPT_DIR/sft/latest"
+echo "DONE! python chat.py --checkpoint $CKPT_DIR/sft/inference_model.pt"

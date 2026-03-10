@@ -45,6 +45,8 @@ from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
     ShardingStrategy,
+    FullStateDictConfig,
+    StateDictType,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
@@ -170,6 +172,24 @@ def save_permanent_checkpoint(model, optimizer, step, config, output_dir, rank, 
 
     if rank == 0:
         log(f"  Permanent checkpoint saved: {ckpt_dir}", rank)
+
+
+def save_inference_checkpoint(model, config, output_dir, rank, is_distributed):
+    """Save a consolidated single-file checkpoint that chat.py can load."""
+    if is_distributed:
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+            state_dict = model.state_dict()
+    else:
+        state_dict = model.state_dict()
+
+    if rank == 0:
+        ckpt_path = Path(output_dir) / "inference_model.pt"
+        torch.save({
+            "model_state_dict": state_dict,
+            "config": config,
+        }, ckpt_path)
+        log(f"  Inference checkpoint saved: {ckpt_path}", rank)
 
 
 def load_checkpoint(model, optimizer, resume_path, device, rank, is_distributed):
@@ -452,10 +472,12 @@ def main():
         dist.barrier()
     save_checkpoint(model, optimizer, step, config, output_dir, rank, is_distributed)
     save_permanent_checkpoint(model, optimizer, step, config, output_dir, rank, is_distributed)
+    save_inference_checkpoint(model, config, output_dir, rank, is_distributed)
 
     log(f"\n{'=' * 60}", rank)
     log(f"  {args.stage.upper()} COMPLETE — {step} steps", rank)
     log(f"  Checkpoints: {output_dir}", rank)
+    log(f"  Inference:   {output_dir}/inference_model.pt", rank)
     log(f"{'=' * 60}", rank)
 
     cleanup_distributed()

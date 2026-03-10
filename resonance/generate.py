@@ -12,7 +12,6 @@ Supports:
 import torch
 import torch.nn.functional as F
 import tiktoken
-from typing import Optional
 
 
 @torch.no_grad()

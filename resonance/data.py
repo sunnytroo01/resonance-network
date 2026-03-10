@@ -167,7 +167,7 @@ class StreamingTextDataset(IterableDataset):
 
         ds = load_dataset(
             self.dataset_name, split=self.split,
-            streaming=True, trust_remote_code=True,
+            streaming=True,
         )
         for example in ds:
             text = example.get("text", "")

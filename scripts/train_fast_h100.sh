@@ -73,5 +73,5 @@ torchrun --nproc_per_node=4 \
 echo ""
 echo "═══════════════════════════════════════════════════════"
 echo "  DONE in ~5 hours. Chatbot ready."
-echo "  python chat.py --checkpoint $CKPT_DIR/sft/latest"
+echo "  python chat.py --checkpoint $CKPT_DIR/sft/inference_model.pt"
 echo "═══════════════════════════════════════════════════════"

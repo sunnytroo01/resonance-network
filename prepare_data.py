@@ -6,6 +6,11 @@ Downloads, tokenizes, and shards ALL training data into binary format:
   Phase 1 - Pre-training corpus (SlimPajama + OpenWebText + StarCoder + Wikipedia)
   Phase 2 - Chat/instruction SFT data (OpenAssistant, Dolly, Alpaca, OpenOrca)
 
+Features:
+  - Automatic resume: skips completed sources and already-processed documents
+  - Retry logic: handles transient network failures with exponential backoff
+  - Progress tracking: saves progress.json periodically
+
 Usage:
     python prepare_data.py --output /workspace/data
 
@@ -16,13 +21,13 @@ Output:
         shard_000001.bin
         ...
         manifest.json
+        progress.json
       sft/
         data.bin           # all SFT tokens packed, uint16
         index.json         # per-example offsets + loss mask starts
 """
 
 import os
-import sys
 import json
 import time
 import argparse
@@ -33,6 +38,8 @@ import tiktoken
 
 # ── Config ──────────────────────────────────────────────────
 SHARD_TOKENS = 100_000_000  # 100M tokens per shard (~200MB)
+MAX_RETRIES = 5
+PROGRESS_SAVE_INTERVAL = 50_000  # save progress every N docs
 
 PRETRAIN_SOURCES = [
     {
@@ -70,7 +77,61 @@ SFT_SOURCES = [
 ]
 
 
+# ── Progress tracking ──────────────────────────────────────
+
+class ProgressTracker:
+    """Tracks data preparation progress for robust resume."""
+
+    def __init__(self, progress_file: Path):
+        self.path = progress_file
+        self.completed_sources = []
+        self.current_source = None
+        self.docs_processed = 0
+        self.load()
+
+    def load(self):
+        if self.path.exists():
+            with open(self.path) as f:
+                data = json.load(f)
+            self.completed_sources = data.get("completed_sources", [])
+            self.current_source = data.get("current_source", None)
+            self.docs_processed = data.get("docs_processed", 0)
+            print(
+                f"  Resuming: {len(self.completed_sources)} sources done, "
+                f"current={self.current_source}, docs={self.docs_processed:,}"
+            )
+
+    def save(self):
+        with open(self.path, "w") as f:
+            json.dump({
+                "completed_sources": self.completed_sources,
+                "current_source": self.current_source,
+                "docs_processed": self.docs_processed,
+            }, f, indent=2)
+
+    def is_source_done(self, name: str) -> bool:
+        return name in self.completed_sources
+
+    def start_source(self, name: str):
+        if self.current_source != name:
+            self.current_source = name
+            self.docs_processed = 0
+        self.save()
+
+    def update(self, docs: int):
+        self.docs_processed = docs
+        self.save()
+
+    def finish_source(self, name: str):
+        if name not in self.completed_sources:
+            self.completed_sources.append(name)
+        self.current_source = None
+        self.docs_processed = 0
+        self.save()
+
+
 # ── Shard writer ────────────────────────────────────────────
+
 class ShardWriter:
     """Writes tokenized data into fixed-size binary shards."""
 
@@ -133,59 +194,136 @@ class ShardWriter:
 
 
 # ── Phase 1: Pre-training data ─────────────────────────────
-def prepare_pretrain(output_dir: Path, enc):
-    """Stream, tokenize, and shard pre-training data."""
+
+def stream_source_with_retry(source, skip_docs=0):
+    """Stream a HuggingFace dataset with retry logic and document skipping."""
     from datasets import load_dataset
 
-    writer = ShardWriter(output_dir / "pretrain")
+    ds_name = source["name"]
+    split = source["split"]
+    config = source.get("config", None)
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            kwargs = dict(split=split, streaming=True)
+            if config:
+                ds = load_dataset(ds_name, config, **kwargs)
+            else:
+                ds = load_dataset(ds_name, **kwargs)
+
+            if skip_docs > 0:
+                print(f"  Skipping {skip_docs:,} already-processed documents...")
+                ds = ds.skip(skip_docs)
+
+            return ds
+
+        except Exception as e:
+            wait = min(2 ** attempt * 10, 300)
+            print(f"  Attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
+            if attempt < MAX_RETRIES - 1:
+                print(f"  Retrying in {wait}s...")
+                time.sleep(wait)
+
+    return None
+
+
+def process_source(source, writer, enc, progress):
+    """Process a single pretrain source with retry on mid-stream failures."""
+    ds_name = source["name"]
+    text_key = source["text_key"]
     eot = np.array([enc.eot_token], dtype=np.uint16)
+
+    skip_docs = 0
+    if progress.current_source == ds_name:
+        skip_docs = progress.docs_processed
+
+    progress.start_source(ds_name)
+    doc_count = skip_docs
+
+    # Retry loop for mid-stream failures
+    retries_left = MAX_RETRIES
+    while retries_left > 0:
+        ds = stream_source_with_retry(source, skip_docs=doc_count)
+        if ds is None:
+            print(f"  WARN: Could not load {ds_name} after {MAX_RETRIES} attempts")
+            return doc_count
+
+        try:
+            for example in ds:
+                text = example.get(text_key, "")
+                if not text or len(text) < 50:
+                    doc_count += 1
+                    continue
+
+                tokens = enc.encode(text, allowed_special=set())
+                arr = np.array(tokens, dtype=np.uint16)
+                writer.add_tokens(arr)
+                writer.add_tokens(eot)
+                doc_count += 1
+
+                if doc_count % PROGRESS_SAVE_INTERVAL == 0:
+                    progress.update(doc_count)
+                    print(
+                        f"    {doc_count:>10,} docs | "
+                        f"{writer.total_tokens + writer.buf_pos:,} tokens"
+                    )
+
+            # Completed successfully
+            break
+
+        except KeyboardInterrupt:
+            progress.update(doc_count)
+            raise
+
+        except Exception as e:
+            retries_left -= 1
+            progress.update(doc_count)
+            wait = min(2 ** (MAX_RETRIES - retries_left) * 10, 300)
+            print(f"\n  Stream interrupted at doc {doc_count:,}: {e}")
+            if retries_left > 0:
+                print(f"  Retrying in {wait}s ({retries_left} retries left)...")
+                time.sleep(wait)
+            else:
+                print(f"  No retries left, moving to next source")
+
+    print(f"  Finished {ds_name}: {doc_count:,} documents")
+    progress.finish_source(ds_name)
+    return doc_count
+
+
+def prepare_pretrain(output_dir: Path, enc):
+    """Stream, tokenize, and shard pre-training data."""
+    pretrain_dir = output_dir / "pretrain"
+    writer = ShardWriter(pretrain_dir)
+    progress = ProgressTracker(pretrain_dir / "progress.json")
 
     for source in PRETRAIN_SOURCES:
         ds_name = source["name"]
-        text_key = source["text_key"]
         desc = source["description"]
-        split = source["split"]
-        config = source.get("config", None)
+
+        if progress.is_source_done(ds_name):
+            print(f"\n  [SKIP] {ds_name} — already completed")
+            continue
 
         print(f"\n{'=' * 60}")
         print(f"  {ds_name}")
         print(f"  {desc}")
         print(f"{'=' * 60}")
 
-        try:
-            kwargs = dict(split=split, streaming=True, trust_remote_code=True)
-            if config:
-                ds = load_dataset(ds_name, config, **kwargs)
-            else:
-                ds = load_dataset(ds_name, **kwargs)
-        except Exception as e:
-            print(f"  WARN: Could not load {ds_name}: {e}")
-            print(f"  Skipping...")
-            continue
-
-        doc_count = 0
-        for example in ds:
-            text = example.get(text_key, "")
-            if not text or len(text) < 50:
-                continue
-
-            tokens = enc.encode(text, allowed_special=set())
-            arr = np.array(tokens, dtype=np.uint16)
-            writer.add_tokens(arr)
-            writer.add_tokens(eot)  # document boundary
-            doc_count += 1
-
-            if doc_count % 100_000 == 0:
-                print(f"    {doc_count:>10,} docs | {writer.total_tokens + writer.buf_pos:,} tokens")
-
-        print(f"  Finished {ds_name}: {doc_count:,} documents")
+        process_source(source, writer, enc, progress)
 
     total = writer.finalize()
+    if total == 0:
+        print("\n  ERROR: No pre-training data was collected!")
+        print("  Check your internet connection and dataset access.")
+        raise RuntimeError("No pre-training data collected")
+
     print(f"\n  Pre-training complete: {total:,} tokens in {writer.shard_idx} shards")
     return total
 
 
 # ── Phase 2: SFT / Chat data ───────────────────────────────
+
 def prepare_sft(output_dir: Path, enc):
     """Download and prepare chat/instruction SFT data."""
     from datasets import load_dataset
@@ -193,7 +331,7 @@ def prepare_sft(output_dir: Path, enc):
     sft_dir = output_dir / "sft"
     sft_dir.mkdir(parents=True, exist_ok=True)
 
-    all_examples = []  # list of {"user": str, "assistant": str}
+    all_examples = []
 
     # ── OpenAssistant ──
     print(f"\n{'=' * 60}")
@@ -201,10 +339,8 @@ def prepare_sft(output_dir: Path, enc):
     print(f"{'=' * 60}")
     try:
         ds = load_dataset("OpenAssistant/oasst1", split="train")
-        messages = {}
         children_map = {}
         for msg in ds:
-            messages[msg["message_id"]] = msg
             pid = msg["parent_id"]
             if pid:
                 children_map.setdefault(pid, []).append(msg)
@@ -217,7 +353,6 @@ def prepare_sft(output_dir: Path, enc):
             assistants = [c for c in kids if c["role"] == "assistant"]
             if not assistants:
                 continue
-            # Pick highest-quality response (lowest rank number)
             best = sorted(assistants, key=lambda m: m.get("rank") or 999)[0]
             user_text = msg["text"].strip()
             asst_text = best["text"].strip()
@@ -284,6 +419,10 @@ def prepare_sft(output_dir: Path, enc):
 
     print(f"\n  Total SFT examples: {len(all_examples)}")
 
+    if len(all_examples) == 0:
+        print("  ERROR: No SFT data was collected!")
+        raise RuntimeError("No SFT data collected")
+
     # ── Tokenize with loss masking ──
     print("  Tokenizing...")
     eot = enc.eot_token
@@ -303,7 +442,7 @@ def prepare_sft(output_dir: Path, enc):
         index.append({
             "offset": offset,
             "length": len(full_tokens),
-            "mask_start": len(user_tokens),  # loss starts here (assistant response)
+            "mask_start": len(user_tokens),
         })
         offset += len(full_tokens)
 
@@ -356,12 +495,12 @@ def main():
     if args.phase in ("all", "pretrain"):
         print("\n\n  PHASE 1: PRE-TRAINING DATA")
         print("  " + "-" * 40)
-        pretrain_tokens = prepare_pretrain(output_dir, enc)
+        prepare_pretrain(output_dir, enc)
 
     if args.phase in ("all", "sft"):
         print("\n\n  PHASE 2: SFT / CHAT DATA")
         print("  " + "-" * 40)
-        sft_tokens = prepare_sft(output_dir, enc)
+        prepare_sft(output_dir, enc)
 
     elapsed = time.time() - _start_time
     print(f"\n{'=' * 60}")
