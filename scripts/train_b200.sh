@@ -7,6 +7,7 @@ set -e
 # ═══════════════════════════════════════════════════════════
 DATA_DIR=${DATA_DIR:-/workspace/data}
 CKPT_DIR=${CKPT_DIR:-/workspace/checkpoints}
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 cd /workspace/resonance-network || { echo "ERROR: repo not found. Run: git clone https://github.com/sunnytroo01/resonance-network.git /workspace/resonance-network"; exit 1; }
 

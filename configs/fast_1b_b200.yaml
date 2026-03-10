@@ -1,6 +1,7 @@
 # 1.3B on 1x NVIDIA B200 — single GPU, no FSDP
-# VRAM: fits comfortably in 80GB+
-# If you have 192GB VRAM, you can increase batch_size to 8
+# VRAM: ~130GB with batch_size=2 on 178GB B200
+# Complex-valued model with dual attention (Kuramoto + Hopfield) uses ~2x
+# the activation memory of a standard transformer at the same param count.
 
 model:
   dim: 2048
@@ -17,8 +18,8 @@ model:
   stability_weight: 0.001
 
 training:
-  batch_size: 3
-  gradient_accumulation: 8
+  batch_size: 2
+  gradient_accumulation: 12
   learning_rate: 3e-4
   min_lr: 3e-5
   weight_decay: 0.1
