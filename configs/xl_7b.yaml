@@ -1,0 +1,35 @@
+# Resonance Network - XL (7B params)
+# Good for: competitive with Llama-7B, needs 16-32 B200s
+# VRAM: ~120GB per GPU with FSDP
+
+model:
+  dim: 4096
+  n_layers: 32
+  num_heads: 32
+  max_seq_len: 4096
+  coupling_rank: 1024
+  num_stored_patterns: 2048
+  hopfield_steps: 1
+  mag_expansion: 4
+  dropout: 0.0
+  dt: 0.1
+  use_sparsemax: false     # softmax faster at scale
+  stability_weight: 0.0005
+
+training:
+  batch_size: 4
+  gradient_accumulation: 32
+  learning_rate: 1.5e-4
+  min_lr: 1.5e-5
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 4000
+  max_steps: 1000000
+  lr_scheduler: cosine
+  seq_len: 4096
+  amp_dtype: bfloat16
+
+data:
+  dataset: slimpajama
+  tokenizer: gpt2
+  num_workers: 16
