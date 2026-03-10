@@ -400,7 +400,6 @@ def main():
     grad_accum = int(tc.get("gradient_accumulation", 1))
     max_steps = int(tc["max_steps"])
     log_interval = 10
-    amp_dtype = torch.bfloat16
 
     log(f"\nStarting {args.stage} training for {max_steps} steps...", rank)
     log(f"  Rolling checkpoints every {args.save_every} steps (keep last {args.keep_checkpoints})", rank)
@@ -431,9 +430,10 @@ def main():
             # redundant all-reduce during gradient accumulation
             sync_context = model.no_sync() if (is_distributed and micro_step < grad_accum - 1) else nullcontext()
             with sync_context:
-                with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                    logits, loss, info = model(input_ids, targets)
-                    loss = loss / grad_accum
+                # No autocast — complex-valued ops produce NaN under bfloat16.
+                # B200 has enough VRAM for full float32.
+                logits, loss, info = model(input_ids, targets)
+                loss = loss / grad_accum
 
                 # Check for NaN BEFORE backward to prevent gradient corruption
                 if not math.isfinite(loss.item()):
