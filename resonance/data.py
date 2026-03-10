@@ -125,14 +125,18 @@ class SFTDataset(Dataset):
 
         tokens = self.data[offset : offset + length].astype(np.int64)
 
-        # Pad short sequences
-        if len(tokens) < self.max_seq_len + 1:
-            padded = np.full(self.max_seq_len + 1, -100, dtype=np.int64)
-            padded[: len(tokens)] = tokens
-            tokens = padded
-
-        x = torch.from_numpy(tokens[:-1].copy())
-        y = torch.from_numpy(tokens[1:].copy())
+        # Pad short sequences — use 0 for inputs (valid token), -100 for labels (ignored by loss)
+        actual_len = len(tokens)
+        if actual_len < self.max_seq_len + 1:
+            input_padded = np.zeros(self.max_seq_len + 1, dtype=np.int64)
+            label_padded = np.full(self.max_seq_len + 1, -100, dtype=np.int64)
+            input_padded[:actual_len] = tokens
+            label_padded[:actual_len] = tokens
+            x = torch.from_numpy(input_padded[:-1].copy())
+            y = torch.from_numpy(label_padded[1:].copy())
+        else:
+            x = torch.from_numpy(tokens[:-1].copy())
+            y = torch.from_numpy(tokens[1:].copy())
 
         # Mask loss on user tokens — only train on assistant response
         y[: max(0, mask_start - 1)] = -100
@@ -173,7 +177,7 @@ class StreamingTextDataset(IterableDataset):
             text = example.get("text", "")
             if not text:
                 continue
-            tokens = self.enc.encode(text, allowed_special=set())
+            tokens = self.enc.encode(text, disallowed_special=())
             yield from tokens
 
     def __iter__(self):

@@ -167,7 +167,7 @@ class RotaryEmbeddingComplex(nn.Module):
         self._build_cache(max_seq_len)
 
     def _build_cache(self, seq_len: int):
-        positions = torch.arange(seq_len, dtype=torch.float32)
+        positions = torch.arange(seq_len, dtype=torch.float32, device=self.inv_freq.device)
         angles = torch.outer(positions, self.inv_freq)  # (seq_len, dim)
         # Complex rotation factors: exp(i * angle)
         rotation = torch.complex(torch.cos(angles), torch.sin(angles))

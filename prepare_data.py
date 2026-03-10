@@ -230,7 +230,7 @@ def process_source(source, writer, enc, progress):
                     doc_count += 1
                     continue
 
-                tokens = enc.encode(text, allowed_special=set())
+                tokens = enc.encode(text, disallowed_special=())
                 arr = np.array(tokens, dtype=np.uint16)
                 writer.add_tokens(arr)
                 writer.add_tokens(eot)
@@ -411,8 +411,8 @@ def prepare_sft(output_dir: Path, enc):
         user_part = f"User: {ex['user']}\nAssistant:"
         full_text = f"{user_part} {ex['assistant']}"
 
-        user_tokens = enc.encode(user_part, allowed_special=set())
-        full_tokens = enc.encode(full_text, allowed_special=set())
+        user_tokens = enc.encode(user_part, disallowed_special=())
+        full_tokens = enc.encode(full_text, disallowed_special=())
         full_tokens.append(eot)
 
         all_tokens.extend(full_tokens)

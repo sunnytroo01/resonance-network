@@ -38,6 +38,7 @@ import yaml
 import shutil
 import argparse
 from pathlib import Path
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -410,11 +411,15 @@ def main():
             input_ids = input_ids.to(device)
             targets = targets.to(device)
 
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                logits, loss, info = model(input_ids, targets)
-                loss = loss / grad_accum
+            # Use no_sync for all micro-steps except the last to avoid
+            # redundant all-reduce during gradient accumulation
+            sync_context = model.no_sync() if (is_distributed and micro_step < grad_accum - 1) else nullcontext()
+            with sync_context:
+                with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                    logits, loss, info = model(input_ids, targets)
+                    loss = loss / grad_accum
 
-            loss.backward()
+                loss.backward()
             accum_loss += loss.item() * grad_accum
             accum_count += 1
 

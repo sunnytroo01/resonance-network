@@ -47,7 +47,7 @@ def generate(
     enc = tiktoken.get_encoding(tokenizer_name)
 
     # Encode prompt
-    input_ids = enc.encode(prompt, allowed_special=set())
+    input_ids = enc.encode(prompt, disallowed_special=())
     input_ids = torch.tensor([input_ids], dtype=torch.long, device=device)
 
     generated = input_ids[0].tolist()
