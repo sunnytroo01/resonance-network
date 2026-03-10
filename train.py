@@ -277,7 +277,7 @@ def main():
     log(f"  Permanent save:   every {args.permanent_save_every} steps", rank)
     if torch.cuda.is_available():
         log(f"  GPU:              {torch.cuda.get_device_name()}", rank)
-        log(f"  VRAM:             {torch.cuda.get_device_properties(local_rank).total_mem / 1e9:.1f} GB", rank)
+        log(f"  VRAM:             {torch.cuda.get_device_properties(local_rank).total_memory / 1e9:.1f} GB", rank)
     log(f"{'=' * 60}", rank)
 
     # ── Data ──
