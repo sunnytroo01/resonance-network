@@ -80,7 +80,7 @@ def main():
         mag_expansion=config.get("mag_expansion", 4),
         dropout=0.0,
         dt=config.get("dt", 0.1),
-        use_sparsemax=config.get("use_sparsemax", False),
+        use_sparsemax=config.get("use_sparsemax", True),
         stability_weight=0.0,
     ).to(args.device)
 

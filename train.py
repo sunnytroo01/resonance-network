@@ -345,7 +345,8 @@ def main():
         mp_policy = MixedPrecision(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
+            # NOTE: do NOT set buffer_dtype — model has complex64 buffers
+            # (RotaryEmbeddingComplex.rotation) that cannot be cast to bfloat16
         )
         auto_wrap = transformer_auto_wrap_policy(
             transformer_layer_cls={ResonanceLayer},
@@ -374,7 +375,12 @@ def main():
     if args.resume:
         log(f"Resuming from {args.resume}...", rank)
         start_step = load_checkpoint(model, optimizer, args.resume, device, rank, is_distributed)
-        log(f"  Resumed at step {start_step}", rank)
+        if start_step >= tc["max_steps"]:
+            # Resuming from a different stage (e.g. pretrain -> SFT): reset step counter
+            log(f"  Loaded weights from step {start_step}, resetting to step 0 for new stage", rank)
+            start_step = 0
+        else:
+            log(f"  Resumed at step {start_step}", rank)
 
     # ── Wandb ──
     if args.wandb and rank == 0:
@@ -437,7 +443,7 @@ def main():
             avg_loss = accum_loss / accum_count
             ppl = math.exp(min(avg_loss, 20))
             dt = time.time() - t0
-            tokens_per_sec = (tc["batch_size"] * tc["seq_len"] * log_interval * world_size) / dt
+            tokens_per_sec = (tc["batch_size"] * tc["seq_len"] * grad_accum * log_interval * world_size) / dt
 
             log(
                 f"  step {step:>8d} | loss {avg_loss:.4f} | ppl {ppl:>8.1f} | "
