@@ -1,0 +1,35 @@
+# Resonance Network - 1.3B - SPEED RUN on 4x H100 80GB
+# Finish in ~5 hours total. Big batches, max throughput.
+# Budget: ~$72 at $3.49/hr per GPU
+
+model:
+  dim: 2048
+  n_layers: 24
+  num_heads: 16
+  max_seq_len: 2048
+  coupling_rank: 512
+  num_stored_patterns: 1024
+  hopfield_steps: 1
+  mag_expansion: 4
+  dropout: 0.05
+  dt: 0.1
+  use_sparsemax: true
+  stability_weight: 0.001
+
+training:
+  batch_size: 48
+  gradient_accumulation: 2
+  learning_rate: 3e-4
+  min_lr: 3e-5
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 200
+  max_steps: 3500
+  lr_scheduler: cosine
+  seq_len: 2048
+  amp_dtype: bfloat16
+
+data:
+  dataset: slimpajama
+  tokenizer: gpt2
+  num_workers: 8
