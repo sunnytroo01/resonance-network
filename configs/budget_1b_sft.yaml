@@ -1,0 +1,43 @@
+# Resonance Network - 1.3B - SFT Chat Fine-tuning
+# Resume from pre-trained budget_1b checkpoint
+# Runtime: ~30 minutes on 4x B200
+#
+# Usage:
+#   torchrun --nproc_per_node=4 train.py \
+#     --config configs/budget_1b_sft.yaml \
+#     --data-dir /workspace/data/sft --stage sft \
+#     --resume /workspace/checkpoints/pretrain/latest \
+#     --output-dir /workspace/checkpoints/sft \
+#     --save-every 50 --keep-checkpoints 3 --wandb
+
+model:
+  dim: 2048
+  n_layers: 24
+  num_heads: 16
+  max_seq_len: 2048
+  coupling_rank: 512
+  num_stored_patterns: 1024
+  hopfield_steps: 1
+  mag_expansion: 4
+  dropout: 0.0
+  dt: 0.1
+  use_sparsemax: true
+  stability_weight: 0.0
+
+training:
+  batch_size: 16
+  gradient_accumulation: 4
+  learning_rate: 2e-5
+  min_lr: 2e-6
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 50
+  max_steps: 500
+  lr_scheduler: cosine
+  seq_len: 2048
+  amp_dtype: bfloat16
+
+data:
+  dataset: sft
+  tokenizer: gpt2
+  num_workers: 8
