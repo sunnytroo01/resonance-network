@@ -4,4 +4,4 @@ torchrun --nproc_per_node=8 \
     train.py \
     --config configs/xl_7b.yaml \
     --output-dir checkpoints/7b \
-    --wandb
+   

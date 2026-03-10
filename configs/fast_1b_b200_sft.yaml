@@ -15,8 +15,8 @@ model:
   stability_weight: 0.0
 
 training:
-  batch_size: 2
-  gradient_accumulation: 12
+  batch_size: 1
+  gradient_accumulation: 24
   learning_rate: 2e-5
   min_lr: 2e-6
   weight_decay: 0.1

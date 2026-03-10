@@ -56,7 +56,7 @@ torchrun --nproc_per_node=8 \
     --save-every 200 \
     --keep-checkpoints 3 \
     --permanent-save-every 1000 \
-    --wandb --wandb-project resonance-1b-5090
+   
 
 echo ""
 echo "Pre-training done!"
@@ -75,7 +75,7 @@ torchrun --nproc_per_node=8 \
     --resume $CKPT_DIR/pretrain/latest \
     --save-every 50 \
     --keep-checkpoints 3 \
-    --wandb --wandb-project resonance-1b-5090-sft
+   
 
 echo ""
 echo "═══════════════════════════════════════════════════════"

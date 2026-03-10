@@ -90,8 +90,7 @@ else
         --data-dir "$DATA_DIR/pretrain" \
         --output-dir "$CKPT_DIR/pretrain" \
         --save-every 200 --keep-checkpoints 3 --permanent-save-every 2000 \
-        $RESUME_FLAG \
-        --wandb --wandb-project resonance-1b
+        $RESUME_FLAG
 fi
 
 # ── Step 4: SFT ──────────────────────────────────────────
@@ -117,8 +116,7 @@ else
         --output-dir "$CKPT_DIR/sft" \
         --stage sft \
         $RESUME_FLAG \
-        --save-every 100 --keep-checkpoints 3 \
-        --wandb --wandb-project resonance-1b-sft
+        --save-every 100 --keep-checkpoints 3
 fi
 
 echo ""

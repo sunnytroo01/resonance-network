@@ -38,8 +38,7 @@ python train.py \
     --config configs/fast_1b_b200.yaml \
     --data-dir $DATA_DIR/pretrain \
     --output-dir $CKPT_DIR/pretrain \
-    --save-every 200 --keep-checkpoints 3 --permanent-save-every 2000 \
-    --wandb --wandb-project resonance-1b
+    --save-every 200 --keep-checkpoints 3 --permanent-save-every 2000
 
 # Phase 2: SFT
 echo "PHASE 2: SFT CHAT"
@@ -49,8 +48,7 @@ python train.py \
     --output-dir $CKPT_DIR/sft \
     --stage sft \
     --resume $CKPT_DIR/pretrain/latest \
-    --save-every 100 --keep-checkpoints 3 \
-    --wandb --wandb-project resonance-1b-sft
+    --save-every 100 --keep-checkpoints 3
 
 echo "═══════════════════════════════════════════════════════"
 echo "  TRAINING COMPLETE!"

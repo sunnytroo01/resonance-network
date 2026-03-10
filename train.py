@@ -9,7 +9,7 @@ Supports:
 - Permanent checkpoints at intervals
 - Streaming dataset fallback
 - Mixed precision (bfloat16)
-- Wandb logging
+- Gradient checkpointing for VRAM savings
 
 Usage:
     # Pre-train 1T on B200 cluster with frequent checkpoints
@@ -18,7 +18,7 @@ Usage:
         train.py --config configs/titan_1t.yaml \
         --data-dir /workspace/data/pretrain \
         --output-dir /workspace/checkpoints/pretrain \
-        --save-every 250 --keep-checkpoints 3 --wandb
+        --save-every 250 --keep-checkpoints 3
 
     # SFT fine-tune for chat
     torchrun --nnodes=64 --nproc_per_node=8 \
@@ -27,7 +27,7 @@ Usage:
         --data-dir /workspace/data/sft --stage sft \
         --resume /workspace/checkpoints/pretrain/latest \
         --output-dir /workspace/checkpoints/sft \
-        --save-every 100 --keep-checkpoints 3 --wandb
+        --save-every 100 --keep-checkpoints 3
 """
 
 import os
@@ -258,8 +258,6 @@ def main():
                         help="Number of rolling checkpoints to keep (default: 3)")
     parser.add_argument("--permanent-save-every", type=int, default=2000,
                         help="Save permanent checkpoint every N steps (default: 2000)")
-    parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb-project", type=str, default="resonance-network")
     args = parser.parse_args()
 
     # ── Distributed ──
@@ -348,6 +346,7 @@ def main():
         dt=float(mc.get("dt", 0.1)),
         use_sparsemax=bool(mc.get("use_sparsemax", True)),
         stability_weight=float(mc.get("stability_weight", 0.01)),
+        gradient_checkpointing=True,
     ).to(device)
 
     n_params = model.get_num_params()
@@ -396,11 +395,6 @@ def main():
             start_step = 0
         else:
             log(f"  Resumed at step {start_step}", rank)
-
-    # ── Wandb ──
-    if args.wandb and rank == 0:
-        import wandb
-        wandb.init(project=args.wandb_project, config=config, name=f"{args.stage}_{mc['dim']}d_{mc['n_layers']}L")
 
     # ── Training loop ──
     grad_accum = int(tc.get("gradient_accumulation", 1))
@@ -467,14 +461,6 @@ def main():
                 f"gpu {torch.cuda.max_memory_allocated(device) / 1e9:.1f}GB",
                 rank,
             )
-
-            if args.wandb and rank == 0:
-                import wandb
-                wandb.log({
-                    "loss": avg_loss, "perplexity": ppl, "lr": lr,
-                    "grad_norm": float(grad_norm), "tokens_per_sec": tokens_per_sec,
-                    "step": step,
-                })
 
             accum_loss = 0.0
             accum_count = 0

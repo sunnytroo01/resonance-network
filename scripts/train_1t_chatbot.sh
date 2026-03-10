@@ -24,7 +24,7 @@ NPROC=${NPROC:-8}
 DATA_DIR=${DATA_DIR:-/workspace/data}
 CKPT_DIR=${CKPT_DIR:-/workspace/checkpoints}
 
-pip install -q tiktoken datasets wandb pyyaml
+pip install -q tiktoken datasets pyyaml
 
 echo "═══════════════════════════════════════════════════════"
 echo "  RESONANCE NETWORK 1T — FULL TRAINING PIPELINE"
@@ -53,7 +53,7 @@ torchrun \
     --save-every 250 \
     --keep-checkpoints 3 \
     --permanent-save-every 2000 \
-    --wandb --wandb-project resonance-1t-pretrain
+   
 
 echo ""
 echo "Pre-training complete!"
@@ -78,7 +78,7 @@ torchrun \
     --save-every 100 \
     --keep-checkpoints 3 \
     --permanent-save-every 1000 \
-    --wandb --wandb-project resonance-1t-sft
+   
 
 echo ""
 echo "═══════════════════════════════════════════════════════"

@@ -9,4 +9,4 @@ torchrun \
     train.py \
     --config configs/titan_1t.yaml \
     --output-dir checkpoints/1t \
-    --wandb
+   

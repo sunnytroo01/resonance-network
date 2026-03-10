@@ -17,6 +17,7 @@ parameters, like a transformer. Gradient flows directly through the stack.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from typing import Optional, Tuple
 
 from .complex_ops import (
@@ -120,6 +121,7 @@ class ResonanceNetwork(nn.Module):
         dt: float = 0.1,
         use_sparsemax: bool = True,
         stability_weight: float = 0.01,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -127,6 +129,7 @@ class ResonanceNetwork(nn.Module):
         self.n_layers = n_layers
         self.max_seq_len = max_seq_len
         self.stability_weight = stability_weight
+        self.gradient_checkpointing = gradient_checkpointing
 
         # Token embedding
         self.token_embedding = nn.Embedding(vocab_size, dim)
@@ -216,7 +219,10 @@ class ResonanceNetwork(nn.Module):
 
         # Pass through layer stack
         for layer in self.layers:
-            z = layer(z, x, mask=mask)
+            if self.gradient_checkpointing and self.training:
+                z = grad_checkpoint(layer, z, x, mask, use_reentrant=False)
+            else:
+                z = layer(z, x, mask=mask)
 
         # Decode: use full complex state (real + imag) for logits
         z_normed = self.output_norm(z)

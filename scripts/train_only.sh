@@ -34,7 +34,7 @@ torchrun --nproc_per_node=4 \
     --data-dir $DATA_DIR/pretrain \
     --output-dir $CKPT_DIR/pretrain \
     --save-every 200 --keep-checkpoints 3 --permanent-save-every 1000 \
-    --wandb --wandb-project resonance-1b
+   
 
 # Phase 2: SFT
 echo "PHASE 2: SFT CHAT"
@@ -46,7 +46,7 @@ torchrun --nproc_per_node=4 \
     --stage sft \
     --resume $CKPT_DIR/pretrain/latest \
     --save-every 50 --keep-checkpoints 3 \
-    --wandb --wandb-project resonance-1b-sft
+   
 
 echo "═══════════════════════════════════════════════════════"
 echo "  TRAINING COMPLETE!"
