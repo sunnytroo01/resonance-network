@@ -231,7 +231,7 @@ class ResonanceNetwork(nn.Module):
             ce_loss = F.cross_entropy(
                 logits.view(-1, self.vocab_size),
                 targets.view(-1),
-                ignore_index=-1,
+                ignore_index=-100,
             )
 
             # Stability penalty: penalize large magnitudes

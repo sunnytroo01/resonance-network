@@ -2,38 +2,44 @@
 Distributed training script for Resonance Network.
 
 Supports:
-- Single GPU
-- Multi-GPU with PyTorch FSDP (Fully Sharded Data Parallel)
+- Single GPU or Multi-GPU with FSDP
+- Pre-training on binary shards (prepare_data.py output)
+- SFT chat fine-tuning with loss masking
+- Very frequent rolling checkpoints (cannot lose progress)
+- Permanent checkpoints at intervals
+- Streaming dataset fallback
 - Mixed precision (bfloat16)
-- Gradient accumulation
-- Streaming datasets
-- Checkpoint saving/resuming
 - Wandb logging
 
 Usage:
-    # Single GPU
-    python train.py --config configs/small_125m.yaml
+    # Pre-train 1T on B200 cluster with frequent checkpoints
+    torchrun --nnodes=64 --nproc_per_node=8 \
+        --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+        train.py --config configs/titan_1t.yaml \
+        --data-dir /workspace/data/pretrain \
+        --output-dir /workspace/checkpoints/pretrain \
+        --save-every 250 --keep-checkpoints 3 --wandb
 
-    # Multi-GPU (FSDP)
-    torchrun --nproc_per_node=8 train.py --config configs/xl_7b.yaml
-
-    # Multi-node
-    torchrun --nnodes=4 --nproc_per_node=8 train.py --config configs/titan_1t.yaml
+    # SFT fine-tune for chat
+    torchrun --nnodes=64 --nproc_per_node=8 \
+        --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+        train.py --config configs/titan_1t_sft.yaml \
+        --data-dir /workspace/data/sft --stage sft \
+        --resume /workspace/checkpoints/pretrain/latest \
+        --output-dir /workspace/checkpoints/sft \
+        --save-every 100 --keep-checkpoints 3 --wandb
 """
 
 import os
-import sys
 import time
 import math
 import json
 import yaml
+import shutil
 import argparse
 from pathlib import Path
-from contextlib import nullcontext
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -43,11 +49,12 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 from resonance.model.resonance_network import ResonanceNetwork, ResonanceLayer
-from resonance.data import create_dataloader
+from resonance.data import create_dataloader, create_pretrain_loader, create_sft_loader
 
+
+# ── Distributed setup ──────────────────────────────────────
 
 def setup_distributed():
-    """Initialize distributed training."""
     if "RANK" in os.environ:
         dist.init_process_group("nccl")
         rank = dist.get_rank()
@@ -63,8 +70,9 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def get_lr(step: int, warmup_steps: int, max_steps: int, max_lr: float, min_lr: float) -> float:
-    """Cosine learning rate schedule with linear warmup."""
+# ── LR schedule ────────────────────────────────────────────
+
+def get_lr(step, warmup_steps, max_steps, max_lr, min_lr):
     if step < warmup_steps:
         return max_lr * step / max(1, warmup_steps)
     decay_ratio = (step - warmup_steps) / max(1, max_steps - warmup_steps)
@@ -73,103 +81,222 @@ def get_lr(step: int, warmup_steps: int, max_steps: int, max_lr: float, min_lr: 
     return min_lr + coeff * (max_lr - min_lr)
 
 
-def load_config(path: str) -> dict:
-    """Load YAML config file."""
+# ── Helpers ────────────────────────────────────────────────
+
+def load_config(path):
     with open(path) as f:
         return yaml.safe_load(f)
 
 
-def log(msg: str, rank: int = 0):
-    """Only print on rank 0."""
+def log(msg, rank=0):
     if rank == 0:
         print(msg, flush=True)
 
 
-def save_checkpoint(model, optimizer, step, config, output_dir, rank):
-    """Save model checkpoint (only on rank 0 for FSDP)."""
-    if rank != 0:
+# ── Checkpoint management ──────────────────────────────────
+
+def save_checkpoint(model, optimizer, step, config, output_dir, rank, is_distributed):
+    """Save checkpoint using distributed checkpoint for FSDP, regular for single GPU."""
+    if rank != 0 and not is_distributed:
         return
 
-    path = Path(output_dir) / f"checkpoint_{step}.pt"
-    state = {
-        "step": step,
-        "config": config,
-    }
+    ckpt_dir = Path(output_dir) / f"step_{step}"
 
-    # For FSDP, we need to gather the full state dict
-    if isinstance(model, FSDP):
-        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
-            state["model_state_dict"] = model.state_dict()
-            state["optimizer_state_dict"] = optimizer.state_dict()
+    if is_distributed:
+        # Use torch.distributed.checkpoint for sharded saves (fast, scalable)
+        import torch.distributed.checkpoint as dist_cp
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        state_dict = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
+        dist_cp.save(state_dict, checkpoint_id=str(ckpt_dir))
+
+        if rank == 0:
+            with open(ckpt_dir / "metadata.json", "w") as f:
+                json.dump({"step": step, "config": config}, f)
     else:
-        state["model_state_dict"] = model.state_dict()
-        state["optimizer_state_dict"] = optimizer.state_dict()
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "step": step,
+            "config": config,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+        }
+        torch.save(state, ckpt_dir / "checkpoint.pt")
 
-    torch.save(state, path)
-    log(f"Checkpoint saved: {path}", rank)
+    # Update "latest" symlink/marker
+    if rank == 0:
+        latest_file = Path(output_dir) / "latest"
+        latest_file.write_text(str(ckpt_dir.resolve()))
+        log(f"  Checkpoint saved: {ckpt_dir}", rank)
 
+
+def manage_rolling_checkpoints(output_dir, keep_n, rank):
+    """Delete old rolling checkpoints, keeping the last N."""
+    if rank != 0:
+        return
+    output_dir = Path(output_dir)
+    # Find all step_* directories that are NOT in permanent/
+    ckpt_dirs = sorted(output_dir.glob("step_*"), key=lambda p: int(p.name.split("_")[1]))
+    while len(ckpt_dirs) > keep_n:
+        oldest = ckpt_dirs.pop(0)
+        shutil.rmtree(oldest, ignore_errors=True)
+
+
+def save_permanent_checkpoint(model, optimizer, step, config, output_dir, rank, is_distributed):
+    """Save a permanent checkpoint that never gets deleted."""
+    perm_dir = Path(output_dir) / "permanent"
+    if rank == 0:
+        perm_dir.mkdir(parents=True, exist_ok=True)
+    if is_distributed:
+        dist.barrier()
+
+    ckpt_dir = perm_dir / f"step_{step}"
+    if is_distributed:
+        import torch.distributed.checkpoint as dist_cp
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        state_dict = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
+        dist_cp.save(state_dict, checkpoint_id=str(ckpt_dir))
+        if rank == 0:
+            with open(ckpt_dir / "metadata.json", "w") as f:
+                json.dump({"step": step, "config": config}, f)
+    else:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "step": step, "config": config,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+        }
+        torch.save(state, ckpt_dir / "checkpoint.pt")
+
+    if rank == 0:
+        log(f"  Permanent checkpoint saved: {ckpt_dir}", rank)
+
+
+def load_checkpoint(model, optimizer, resume_path, device, rank, is_distributed):
+    """Load from a checkpoint directory."""
+    resume_path = Path(resume_path)
+
+    # If it's a "latest" file, read the actual path
+    if resume_path.name == "latest" and resume_path.is_file():
+        resume_path = Path(resume_path.read_text().strip())
+
+    if is_distributed:
+        import torch.distributed.checkpoint as dist_cp
+        state_dict = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
+        dist_cp.load(state_dict, checkpoint_id=str(resume_path))
+        model.load_state_dict(state_dict["model"])
+        optimizer.load_state_dict(state_dict["optimizer"])
+        meta_file = resume_path / "metadata.json"
+        if meta_file.exists():
+            with open(meta_file) as f:
+                meta = json.load(f)
+            return meta.get("step", 0)
+        return 0
+    else:
+        ckpt_file = resume_path / "checkpoint.pt"
+        if ckpt_file.exists():
+            ckpt = torch.load(ckpt_file, map_location=device, weights_only=False)
+        else:
+            # Legacy single-file checkpoint
+            ckpt = torch.load(str(resume_path), map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        return ckpt.get("step", 0)
+
+
+# ── Main ───────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
+    parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="checkpoints")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
-    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Path to pre-tokenized data (from prepare_data.py)")
+    parser.add_argument("--stage", type=str, default="pretrain", choices=["pretrain", "sft"],
+                        help="Training stage: pretrain or sft")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Checkpoint dir to resume from (or path to 'latest' file)")
+    parser.add_argument("--save-every", type=int, default=250,
+                        help="Save rolling checkpoint every N steps (default: 250)")
+    parser.add_argument("--keep-checkpoints", type=int, default=3,
+                        help="Number of rolling checkpoints to keep (default: 3)")
+    parser.add_argument("--permanent-save-every", type=int, default=2000,
+                        help="Save permanent checkpoint every N steps (default: 2000)")
+    parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="resonance-network")
     args = parser.parse_args()
 
-    # Distributed setup
+    # ── Distributed ──
     rank, world_size, local_rank = setup_distributed()
     device = f"cuda:{local_rank}"
     is_distributed = world_size > 1
 
-    # Load config
+    # ── Config ──
     config = load_config(args.config)
     mc = config["model"]
     tc = config["training"]
     dc = config["data"]
 
-    # Output
     output_dir = Path(args.output_dir)
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
         with open(output_dir / "config.yaml", "w") as f:
             yaml.dump(config, f)
 
-    log(f"=" * 60, rank)
-    log(f"RESONANCE NETWORK - DISTRIBUTED TRAINING", rank)
-    log(f"=" * 60, rank)
-    log(f"World size: {world_size}", rank)
-    log(f"Model dim: {mc['dim']}, layers: {mc['n_layers']}, heads: {mc['num_heads']}", rank)
-    log(f"Seq len: {tc['seq_len']}, batch: {tc['batch_size']} x {tc.get('gradient_accumulation', 1)} accum", rank)
-    log(f"Effective batch: {tc['batch_size'] * tc.get('gradient_accumulation', 1) * world_size}", rank)
+    log(f"{'=' * 60}", rank)
+    log(f"  RESONANCE NETWORK — {args.stage.upper()}", rank)
+    log(f"{'=' * 60}", rank)
+    log(f"  World size:       {world_size}", rank)
+    log(f"  Model:            dim={mc['dim']}, layers={mc['n_layers']}, heads={mc['num_heads']}", rank)
+    log(f"  Seq len:          {tc['seq_len']}", rank)
+    log(f"  Batch:            {tc['batch_size']} x {tc.get('gradient_accumulation', 1)} accum x {world_size} GPUs", rank)
+    effective_batch = tc["batch_size"] * tc.get("gradient_accumulation", 1) * world_size
+    log(f"  Effective batch:  {effective_batch}", rank)
+    log(f"  Save every:       {args.save_every} steps (keep {args.keep_checkpoints})", rank)
+    log(f"  Permanent save:   every {args.permanent_save_every} steps", rank)
     if torch.cuda.is_available():
-        log(f"GPU: {torch.cuda.get_device_name()}", rank)
-        log(f"VRAM: {torch.cuda.get_device_properties(local_rank).total_mem / 1e9:.1f} GB", rank)
-    log(f"=" * 60, rank)
+        log(f"  GPU:              {torch.cuda.get_device_name()}", rank)
+        log(f"  VRAM:             {torch.cuda.get_device_properties(local_rank).total_mem / 1e9:.1f} GB", rank)
+    log(f"{'=' * 60}", rank)
 
-    # Data
-    log("Loading streaming dataset...", rank)
-    dataset_map = {
-        "slimpajama": "cerebras/SlimPajama-627B",
-        "redpajama": "togethercomputer/RedPajama-Data-1T",
-        "openwebtext": "Skylion007/openwebtext",
-    }
-    dataset_name = dataset_map.get(dc["dataset"], dc["dataset"])
+    # ── Data ──
+    log("Loading data...", rank)
 
-    train_loader, vocab_size = create_dataloader(
-        dataset_name=dataset_name,
-        split="train",
-        seq_len=tc["seq_len"],
-        batch_size=tc["batch_size"],
-        tokenizer_name=dc.get("tokenizer", "gpt2"),
-        num_workers=dc.get("num_workers", 4),
-    )
-    log(f"Vocab size: {vocab_size}", rank)
+    if args.data_dir:
+        if args.stage == "sft":
+            train_loader, vocab_size = create_sft_loader(
+                data_dir=args.data_dir,
+                max_seq_len=tc["seq_len"],
+                batch_size=tc["batch_size"],
+                num_workers=dc.get("num_workers", 4),
+            )
+        else:
+            train_loader, vocab_size = create_pretrain_loader(
+                data_dir=args.data_dir,
+                seq_len=tc["seq_len"],
+                batch_size=tc["batch_size"],
+                num_workers=dc.get("num_workers", 4),
+                rank=rank,
+                world_size=world_size,
+            )
+    else:
+        # Streaming fallback
+        dataset_map = {
+            "slimpajama": "cerebras/SlimPajama-627B",
+            "redpajama": "togethercomputer/RedPajama-Data-1T",
+            "openwebtext": "Skylion007/openwebtext",
+        }
+        dataset_name = dataset_map.get(dc["dataset"], dc["dataset"])
+        train_loader, vocab_size = create_dataloader(
+            dataset_name=dataset_name, split="train",
+            seq_len=tc["seq_len"], batch_size=tc["batch_size"],
+            tokenizer_name=dc.get("tokenizer", "gpt2"),
+            num_workers=dc.get("num_workers", 4),
+        )
 
-    # Build model
+    log(f"  Vocab size: {vocab_size}", rank)
+
+    # ── Model ──
     log("Building Resonance Network...", rank)
     model = ResonanceNetwork(
         vocab_size=vocab_size,
@@ -188,10 +315,10 @@ def main():
     ).to(device)
 
     n_params = model.get_num_params()
-    log(f"Parameters: {n_params:,} (non-embedding)", rank)
-    log(f"Parameters: {model.get_num_params(False):,} (total)", rank)
+    log(f"  Parameters: {n_params:,} (non-embedding)", rank)
+    log(f"  Parameters: {model.get_num_params(False):,} (total)", rank)
 
-    # Wrap with FSDP for multi-GPU
+    # ── FSDP ──
     if is_distributed:
         log("Wrapping with FSDP...", rank)
         mp_policy = MixedPrecision(
@@ -199,22 +326,20 @@ def main():
             reduce_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
         )
-
-        auto_wrap_policy = transformer_auto_wrap_policy(
+        auto_wrap = transformer_auto_wrap_policy(
             transformer_layer_cls={ResonanceLayer},
         )
-
         model = FSDP(
             model,
-            auto_wrap_policy=auto_wrap_policy,
+            auto_wrap_policy=auto_wrap,
             mixed_precision=mp_policy,
             sharding_strategy=ShardingStrategy.FULL_SHARD,
             device_id=local_rank,
             limit_all_gathers=True,
         )
-        log("FSDP ready", rank)
+        log("  FSDP ready", rank)
 
-    # Optimizer
+    # ── Optimizer ──
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=tc["learning_rate"],
@@ -223,40 +348,36 @@ def main():
         fused=True,
     )
 
-    # Resume from checkpoint
+    # ── Resume ──
     start_step = 0
     if args.resume:
         log(f"Resuming from {args.resume}...", rank)
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_step = ckpt["step"]
-        log(f"Resumed at step {start_step}", rank)
+        start_step = load_checkpoint(model, optimizer, args.resume, device, rank, is_distributed)
+        log(f"  Resumed at step {start_step}", rank)
 
-    # Wandb
+    # ── Wandb ──
     if args.wandb and rank == 0:
         import wandb
-        wandb.init(project=args.wandb_project, config=config)
+        wandb.init(project=args.wandb_project, config=config, name=f"{args.stage}_{mc['dim']}d_{mc['n_layers']}L")
 
-    # Training loop
+    # ── Training loop ──
     grad_accum = tc.get("gradient_accumulation", 1)
     max_steps = tc["max_steps"]
     log_interval = 10
-    save_interval = 5000
     amp_dtype = torch.bfloat16
 
-    log(f"\nStarting training for {max_steps} steps...", rank)
+    log(f"\nStarting {args.stage} training for {max_steps} steps...", rank)
+    log(f"  Rolling checkpoints every {args.save_every} steps (keep last {args.keep_checkpoints})", rank)
+    log(f"  Permanent checkpoints every {args.permanent_save_every} steps\n", rank)
 
     model.train()
     step = start_step
     accum_loss = 0.0
     accum_count = 0
     data_iter = iter(train_loader)
-
     t0 = time.time()
 
     while step < max_steps:
-        # Accumulate gradients
         optimizer.zero_grad(set_to_none=True)
 
         for micro_step in range(grad_accum):
@@ -269,29 +390,24 @@ def main():
             input_ids = input_ids.to(device)
             targets = targets.to(device)
 
-            # Forward
-            ctx = torch.autocast(device_type="cuda", dtype=amp_dtype)
-            with ctx:
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 logits, loss, info = model(input_ids, targets)
                 loss = loss / grad_accum
 
-            # Backward
             loss.backward()
             accum_loss += loss.item() * grad_accum
             accum_count += 1
 
-        # Update LR
+        # LR schedule
         lr = get_lr(step, tc["warmup_steps"], max_steps, tc["learning_rate"], tc.get("min_lr", 1e-5))
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        # Clip and step
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), tc.get("max_grad_norm", 1.0))
         optimizer.step()
-
         step += 1
 
-        # Logging
+        # ── Logging ──
         if step % log_interval == 0:
             avg_loss = accum_loss / accum_count
             ppl = math.exp(min(avg_loss, 20))
@@ -299,10 +415,10 @@ def main():
             tokens_per_sec = (tc["batch_size"] * tc["seq_len"] * log_interval * world_size) / dt
 
             log(
-                f"step {step:>7d} | loss {avg_loss:.4f} | ppl {ppl:.1f} | "
+                f"  step {step:>8d} | loss {avg_loss:.4f} | ppl {ppl:>8.1f} | "
                 f"lr {lr:.2e} | grad {grad_norm:.2f} | "
-                f"tok/s {tokens_per_sec:.0f} | "
-                f"gpu_mem {torch.cuda.max_memory_allocated(device) / 1e9:.1f}GB",
+                f"tok/s {tokens_per_sec:>10,.0f} | "
+                f"gpu {torch.cuda.max_memory_allocated(device) / 1e9:.1f}GB",
                 rank,
             )
 
@@ -310,7 +426,7 @@ def main():
                 import wandb
                 wandb.log({
                     "loss": avg_loss, "perplexity": ppl, "lr": lr,
-                    "grad_norm": grad_norm, "tokens_per_sec": tokens_per_sec,
+                    "grad_norm": float(grad_norm), "tokens_per_sec": tokens_per_sec,
                     "step": step,
                 })
 
@@ -318,18 +434,30 @@ def main():
             accum_count = 0
             t0 = time.time()
 
-        # Save checkpoint
-        if step % save_interval == 0:
+        # ── Rolling checkpoint ──
+        if step % args.save_every == 0:
             if is_distributed:
                 dist.barrier()
-            save_checkpoint(model, optimizer, step, config, output_dir, rank)
+            save_checkpoint(model, optimizer, step, config, output_dir, rank, is_distributed)
+            manage_rolling_checkpoints(output_dir, args.keep_checkpoints, rank)
 
-    # Final save
+        # ── Permanent checkpoint ──
+        if step % args.permanent_save_every == 0:
+            if is_distributed:
+                dist.barrier()
+            save_permanent_checkpoint(model, optimizer, step, config, output_dir, rank, is_distributed)
+
+    # ── Final save ──
     if is_distributed:
         dist.barrier()
-    save_checkpoint(model, optimizer, step, config, output_dir, rank)
+    save_checkpoint(model, optimizer, step, config, output_dir, rank, is_distributed)
+    save_permanent_checkpoint(model, optimizer, step, config, output_dir, rank, is_distributed)
 
-    log("\nTraining complete!", rank)
+    log(f"\n{'=' * 60}", rank)
+    log(f"  {args.stage.upper()} COMPLETE — {step} steps", rank)
+    log(f"  Checkpoints: {output_dir}", rank)
+    log(f"{'=' * 60}", rank)
+
     cleanup_distributed()
 
 
