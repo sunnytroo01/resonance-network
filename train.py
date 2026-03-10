@@ -346,7 +346,7 @@ def main():
         dt=float(mc.get("dt", 0.1)),
         use_sparsemax=bool(mc.get("use_sparsemax", True)),
         stability_weight=float(mc.get("stability_weight", 0.01)),
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,
     ).to(device)
 
     n_params = model.get_num_params()
@@ -437,6 +437,8 @@ def main():
 
                 # Check for NaN BEFORE backward to prevent gradient corruption
                 if not math.isfinite(loss.item()):
+                    if micro_step == 0:
+                        log(f"  [DEBUG] loss={loss.item()}, ce={info.get('ce_loss','?')}, stab={info.get('stability_loss','?')}", rank)
                     continue
 
                 loss.backward()
