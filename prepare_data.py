@@ -3,28 +3,13 @@
 One-command data preparation for Resonance Network.
 
 Downloads, tokenizes, and shards ALL training data into binary format:
-  Phase 1 - Pre-training corpus (SlimPajama + OpenWebText + StarCoder + Wikipedia)
+  Phase 1 - Pre-training corpus (FineWeb-Edu + OpenWebText + Wikipedia)
   Phase 2 - Chat/instruction SFT data (OpenAssistant, Dolly, Alpaca, OpenOrca)
 
-Features:
-  - Automatic resume: skips completed sources and already-processed documents
-  - Retry logic: handles transient network failures with exponential backoff
-  - Progress tracking: saves progress.json periodically
+All datasets are open-access, no authentication or gating required.
 
 Usage:
     python prepare_data.py --output /workspace/data
-
-Output:
-    data/
-      pretrain/
-        shard_000000.bin   # 100M tokens each, uint16
-        shard_000001.bin
-        ...
-        manifest.json
-        progress.json
-      sft/
-        data.bin           # all SFT tokens packed, uint16
-        index.json         # per-example offsets + loss mask starts
 """
 
 import os
@@ -39,14 +24,17 @@ import tiktoken
 # ── Config ──────────────────────────────────────────────────
 SHARD_TOKENS = 100_000_000  # 100M tokens per shard (~200MB)
 MAX_RETRIES = 5
+RETRY_BASE_WAIT = 15  # seconds
 PROGRESS_SAVE_INTERVAL = 50_000  # save progress every N docs
 
+# Only datasets that are 100% open and accessible — no gated repos
 PRETRAIN_SOURCES = [
     {
-        "name": "cerebras/SlimPajama-627B",
+        "name": "HuggingFaceFW/fineweb-edu",
+        "config": "sample-10BT",
         "split": "train",
         "text_key": "text",
-        "description": "627B token web corpus",
+        "description": "FineWeb-Edu 10B token sample (high-quality web text)",
     },
     {
         "name": "Skylion007/openwebtext",
@@ -55,25 +43,12 @@ PRETRAIN_SOURCES = [
         "description": "OpenWebText (~9B tokens)",
     },
     {
-        "name": "bigcode/starcoderdata",
-        "split": "train",
-        "text_key": "content",
-        "description": "Code data for coding ability",
-    },
-    {
         "name": "wikimedia/wikipedia",
         "config": "20231101.en",
         "split": "train",
         "text_key": "text",
-        "description": "English Wikipedia",
+        "description": "English Wikipedia (~4B tokens)",
     },
-]
-
-SFT_SOURCES = [
-    "OpenAssistant/oasst1",
-    "databricks/databricks-dolly-15k",
-    "yahma/alpaca-cleaned",
-    "Open-Orca/OpenOrca",
 ]
 
 
@@ -102,12 +77,14 @@ class ProgressTracker:
             )
 
     def save(self):
-        with open(self.path, "w") as f:
+        tmp = str(self.path) + ".tmp"
+        with open(tmp, "w") as f:
             json.dump({
                 "completed_sources": self.completed_sources,
                 "current_source": self.current_source,
                 "docs_processed": self.docs_processed,
             }, f, indent=2)
+        os.replace(tmp, str(self.path))
 
     def is_source_done(self, name: str) -> bool:
         return name in self.completed_sources
@@ -195,8 +172,8 @@ class ShardWriter:
 
 # ── Phase 1: Pre-training data ─────────────────────────────
 
-def stream_source_with_retry(source, skip_docs=0):
-    """Stream a HuggingFace dataset with retry logic and document skipping."""
+def open_stream(source):
+    """Open a streaming dataset. Returns the iterable or None on failure."""
     from datasets import load_dataset
 
     ds_name = source["name"]
@@ -205,25 +182,17 @@ def stream_source_with_retry(source, skip_docs=0):
 
     for attempt in range(MAX_RETRIES):
         try:
-            kwargs = dict(split=split, streaming=True)
             if config:
-                ds = load_dataset(ds_name, config, **kwargs)
+                ds = load_dataset(ds_name, config, split=split, streaming=True)
             else:
-                ds = load_dataset(ds_name, **kwargs)
-
-            if skip_docs > 0:
-                print(f"  Skipping {skip_docs:,} already-processed documents...")
-                ds = ds.skip(skip_docs)
-
+                ds = load_dataset(ds_name, split=split, streaming=True)
             return ds
-
         except Exception as e:
-            wait = min(2 ** attempt * 10, 300)
-            print(f"  Attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
+            wait = min(RETRY_BASE_WAIT * (2 ** attempt), 300)
+            print(f"  Attempt {attempt + 1}/{MAX_RETRIES} to open {ds_name}: {e}")
             if attempt < MAX_RETRIES - 1:
-                print(f"  Retrying in {wait}s...")
+                print(f"  Waiting {wait}s before retry...")
                 time.sleep(wait)
-
     return None
 
 
@@ -239,14 +208,20 @@ def process_source(source, writer, enc, progress):
 
     progress.start_source(ds_name)
     doc_count = skip_docs
+    stream_retries = MAX_RETRIES
 
-    # Retry loop for mid-stream failures
-    retries_left = MAX_RETRIES
-    while retries_left > 0:
-        ds = stream_source_with_retry(source, skip_docs=doc_count)
+    while stream_retries > 0:
+        # Open dataset stream
+        ds = open_stream(source)
         if ds is None:
-            print(f"  WARN: Could not load {ds_name} after {MAX_RETRIES} attempts")
+            print(f"  Could not open {ds_name}, skipping")
+            progress.finish_source(ds_name)
             return doc_count
+
+        # Skip already-processed docs
+        if doc_count > 0:
+            print(f"  Skipping {doc_count:,} already-processed docs...")
+            ds = ds.skip(doc_count)
 
         try:
             for example in ds:
@@ -268,7 +243,7 @@ def process_source(source, writer, enc, progress):
                         f"{writer.total_tokens + writer.buf_pos:,} tokens"
                     )
 
-            # Completed successfully
+            # If we get here, the stream finished without error
             break
 
         except KeyboardInterrupt:
@@ -276,17 +251,17 @@ def process_source(source, writer, enc, progress):
             raise
 
         except Exception as e:
-            retries_left -= 1
+            stream_retries -= 1
             progress.update(doc_count)
-            wait = min(2 ** (MAX_RETRIES - retries_left) * 10, 300)
-            print(f"\n  Stream interrupted at doc {doc_count:,}: {e}")
-            if retries_left > 0:
-                print(f"  Retrying in {wait}s ({retries_left} retries left)...")
+            wait = min(RETRY_BASE_WAIT * (2 ** (MAX_RETRIES - stream_retries)), 300)
+            print(f"\n  Stream broke at doc {doc_count:,}: {type(e).__name__}: {e}")
+            if stream_retries > 0:
+                print(f"  Will reconnect in {wait}s ({stream_retries} retries left)...")
                 time.sleep(wait)
             else:
-                print(f"  No retries left, moving to next source")
+                print(f"  Out of retries for {ds_name}, moving on")
 
-    print(f"  Finished {ds_name}: {doc_count:,} documents")
+    print(f"  Done with {ds_name}: {doc_count:,} documents")
     progress.finish_source(ds_name)
     return doc_count
 
@@ -297,6 +272,7 @@ def prepare_pretrain(output_dir: Path, enc):
     writer = ShardWriter(pretrain_dir)
     progress = ProgressTracker(pretrain_dir / "progress.json")
 
+    sources_attempted = 0
     for source in PRETRAIN_SOURCES:
         ds_name = source["name"]
         desc = source["description"]
@@ -311,12 +287,14 @@ def prepare_pretrain(output_dir: Path, enc):
         print(f"{'=' * 60}")
 
         process_source(source, writer, enc, progress)
+        sources_attempted += 1
 
     total = writer.finalize()
     if total == 0:
-        print("\n  ERROR: No pre-training data was collected!")
-        print("  Check your internet connection and dataset access.")
-        raise RuntimeError("No pre-training data collected")
+        raise RuntimeError(
+            "No pre-training data was collected! "
+            "Check your internet connection."
+        )
 
     print(f"\n  Pre-training complete: {total:,} tokens in {writer.shard_idx} shards")
     return total
@@ -420,8 +398,7 @@ def prepare_sft(output_dir: Path, enc):
     print(f"\n  Total SFT examples: {len(all_examples)}")
 
     if len(all_examples) == 0:
-        print("  ERROR: No SFT data was collected!")
-        raise RuntimeError("No SFT data collected")
+        raise RuntimeError("No SFT data collected!")
 
     # ── Tokenize with loss masking ──
     print("  Tokenizing...")
