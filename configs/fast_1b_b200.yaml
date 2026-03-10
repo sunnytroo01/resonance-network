@@ -20,8 +20,8 @@ model:
 training:
   batch_size: 1
   gradient_accumulation: 24
-  learning_rate: 3e-4
-  min_lr: 3e-5
+  learning_rate: 1e-4
+  min_lr: 1e-5
   weight_decay: 0.1
   max_grad_norm: 1.0
   warmup_steps: 500

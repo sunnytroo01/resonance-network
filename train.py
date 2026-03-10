@@ -438,6 +438,14 @@ def main():
             accum_loss += loss.item() * grad_accum
             accum_count += 1
 
+        # NaN detection — skip step if loss exploded
+        if not math.isfinite(accum_loss / max(accum_count, 1)):
+            log(f"  [WARN] NaN/Inf loss at step {step + 1}, skipping update", rank)
+            optimizer.zero_grad(set_to_none=True)
+            accum_loss = 0.0
+            accum_count = 0
+            continue
+
         # LR schedule
         lr = get_lr(step, int(tc["warmup_steps"]), max_steps, float(tc["learning_rate"]), float(tc.get("min_lr", 1e-5)))
         for pg in optimizer.param_groups:
