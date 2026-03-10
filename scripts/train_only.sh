@@ -16,9 +16,8 @@ if [ ! -f "$DATA_DIR/pretrain/manifest.json" ]; then
     exit 1
 fi
 if [ ! -f "$DATA_DIR/sft/index.json" ]; then
-    echo "ERROR: No SFT data found at $DATA_DIR/sft/"
-    echo "Run 'bash scripts/prepare_only.sh' on a cheap pod first."
-    exit 1
+    echo "No SFT data found — preparing it now (takes ~10 min)..."
+    python prepare_data.py --output $DATA_DIR --phase sft
 fi
 
 echo "═══════════════════════════════════════════════════════"
