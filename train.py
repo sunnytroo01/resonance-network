@@ -88,7 +88,22 @@ def get_lr(step, warmup_steps, max_steps, max_lr, min_lr):
 
 def load_config(path):
     with open(path) as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    # PyYAML sometimes parses scientific notation (e.g. 3e-4) as strings.
+    # Normalize all string values that look like numbers to int/float.
+    for section in config.values():
+        if not isinstance(section, dict):
+            continue
+        for key, val in section.items():
+            if isinstance(val, str):
+                try:
+                    section[key] = int(val)
+                except ValueError:
+                    try:
+                        section[key] = float(val)
+                    except ValueError:
+                        pass
+    return config
 
 
 def log(msg, rank=0):
@@ -271,7 +286,7 @@ def main():
     log(f"  Model:            dim={mc['dim']}, layers={mc['n_layers']}, heads={mc['num_heads']}", rank)
     log(f"  Seq len:          {tc['seq_len']}", rank)
     log(f"  Batch:            {tc['batch_size']} x {tc.get('gradient_accumulation', 1)} accum x {world_size} GPUs", rank)
-    effective_batch = tc["batch_size"] * tc.get("gradient_accumulation", 1) * world_size
+    effective_batch = int(tc["batch_size"]) * int(tc.get("gradient_accumulation", 1)) * world_size
     log(f"  Effective batch:  {effective_batch}", rank)
     log(f"  Save every:       {args.save_every} steps (keep {args.keep_checkpoints})", rank)
     log(f"  Permanent save:   every {args.permanent_save_every} steps", rank)
@@ -321,18 +336,18 @@ def main():
     log("Building Resonance Network...", rank)
     model = ResonanceNetwork(
         vocab_size=vocab_size,
-        dim=mc["dim"],
-        n_layers=mc["n_layers"],
-        max_seq_len=mc.get("max_seq_len", tc["seq_len"]),
-        coupling_rank=mc.get("coupling_rank", mc["dim"] // 4),
-        num_heads=mc["num_heads"],
-        num_stored_patterns=mc.get("num_stored_patterns", 256),
-        hopfield_steps=mc.get("hopfield_steps", 1),
-        mag_expansion=mc.get("mag_expansion", 4),
-        dropout=mc.get("dropout", 0.1),
-        dt=mc.get("dt", 0.1),
-        use_sparsemax=mc.get("use_sparsemax", True),
-        stability_weight=mc.get("stability_weight", 0.01),
+        dim=int(mc["dim"]),
+        n_layers=int(mc["n_layers"]),
+        max_seq_len=int(mc.get("max_seq_len", tc["seq_len"])),
+        coupling_rank=int(mc.get("coupling_rank", mc["dim"] // 4)),
+        num_heads=int(mc["num_heads"]),
+        num_stored_patterns=int(mc.get("num_stored_patterns", 256)),
+        hopfield_steps=int(mc.get("hopfield_steps", 1)),
+        mag_expansion=int(mc.get("mag_expansion", 4)),
+        dropout=float(mc.get("dropout", 0.1)),
+        dt=float(mc.get("dt", 0.1)),
+        use_sparsemax=bool(mc.get("use_sparsemax", True)),
+        stability_weight=float(mc.get("stability_weight", 0.01)),
     ).to(device)
 
     n_params = model.get_num_params()
@@ -364,8 +379,8 @@ def main():
     # ── Optimizer ──
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=tc["learning_rate"],
-        weight_decay=tc.get("weight_decay", 0.1),
+        lr=float(tc["learning_rate"]),
+        weight_decay=float(tc.get("weight_decay", 0.1)),
         betas=(0.9, 0.95),
         fused=True,
     )
@@ -375,7 +390,7 @@ def main():
     if args.resume:
         log(f"Resuming from {args.resume}...", rank)
         start_step = load_checkpoint(model, optimizer, args.resume, device, rank, is_distributed)
-        if start_step >= tc["max_steps"]:
+        if start_step >= int(tc["max_steps"]):
             # Resuming from a different stage (e.g. pretrain -> SFT): reset step counter
             log(f"  Loaded weights from step {start_step}, resetting to step 0 for new stage", rank)
             start_step = 0
@@ -388,8 +403,8 @@ def main():
         wandb.init(project=args.wandb_project, config=config, name=f"{args.stage}_{mc['dim']}d_{mc['n_layers']}L")
 
     # ── Training loop ──
-    grad_accum = tc.get("gradient_accumulation", 1)
-    max_steps = tc["max_steps"]
+    grad_accum = int(tc.get("gradient_accumulation", 1))
+    max_steps = int(tc["max_steps"])
     log_interval = 10
     amp_dtype = torch.bfloat16
 
@@ -430,11 +445,11 @@ def main():
             accum_count += 1
 
         # LR schedule
-        lr = get_lr(step, tc["warmup_steps"], max_steps, tc["learning_rate"], tc.get("min_lr", 1e-5))
+        lr = get_lr(step, int(tc["warmup_steps"]), max_steps, float(tc["learning_rate"]), float(tc.get("min_lr", 1e-5)))
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), tc.get("max_grad_norm", 1.0))
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(tc.get("max_grad_norm", 1.0)))
         optimizer.step()
         step += 1
 
@@ -443,7 +458,7 @@ def main():
             avg_loss = accum_loss / accum_count
             ppl = math.exp(min(avg_loss, 20))
             dt = time.time() - t0
-            tokens_per_sec = (tc["batch_size"] * tc["seq_len"] * grad_accum * log_interval * world_size) / dt
+            tokens_per_sec = (int(tc["batch_size"]) * int(tc["seq_len"]) * grad_accum * log_interval * world_size) / dt
 
             log(
                 f"  step {step:>8d} | loss {avg_loss:.4f} | ppl {ppl:>8.1f} | "
