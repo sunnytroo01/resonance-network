@@ -160,6 +160,8 @@ class OscillatoryBlock(nn.Module):
         # Phase update: natural frequency + coupling
         phase = complex_phase(z)
         new_phase = phase + self.dt * (self.omega + phase_delta)
+        # Keep phase in [-pi, pi] to prevent precision loss in cos/sin with bfloat16
+        new_phase = torch.remainder(new_phase + math.pi, 2 * math.pi) - math.pi
 
         # Inject value mix into complex state
         val_proj = self.value_to_complex(value_mix)
@@ -170,6 +172,7 @@ class OscillatoryBlock(nn.Module):
         mag_normed = self.norm2(mag)
         mag_ffn = self.mag_down(F.silu(self.mag_gate(mag_normed)) * self.mag_up(mag_normed))
         new_mag = mag + mag_ffn
+        new_mag = new_mag.clamp(-20.0, 20.0)  # prevent bfloat16 overflow
         new_mag = F.softplus(new_mag)  # keep positive
 
         # Reconstruct complex state

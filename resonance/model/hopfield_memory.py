@@ -145,8 +145,8 @@ class HopfieldMemory(nn.Module):
         keys = self.W_key(patterns).view(B, P_total, H, hd).transpose(1, 2)  # (B, H, P+S, hd)
         values = self.W_value(patterns).view(B, P_total, H, hd).transpose(1, 2)
 
-        # Temperature per head
-        temp = self.log_temp.exp().view(1, H, 1, 1)  # (1, H, 1, 1)
+        # Temperature per head (clamp log_temp to prevent underflow/overflow)
+        temp = self.log_temp.clamp(-4.0, 4.0).exp().view(1, H, 1, 1)  # (1, H, 1, 1)
 
         # Iterative Hopfield retrieval (multiple steps of energy minimization)
         state = queries  # initial retrieval state

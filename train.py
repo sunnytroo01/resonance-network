@@ -416,6 +416,7 @@ def main():
     while step < max_steps:
         optimizer.zero_grad(set_to_none=True)
 
+        valid_micro = 0
         for micro_step in range(grad_accum):
             try:
                 input_ids, targets = next(data_iter)
@@ -434,16 +435,21 @@ def main():
                     logits, loss, info = model(input_ids, targets)
                     loss = loss / grad_accum
 
+                # Check for NaN BEFORE backward to prevent gradient corruption
+                if not math.isfinite(loss.item()):
+                    continue
+
                 loss.backward()
             accum_loss += loss.item() * grad_accum
             accum_count += 1
+            valid_micro += 1
 
-        # NaN detection — skip step if loss exploded
-        if not math.isfinite(accum_loss / max(accum_count, 1)):
-            log(f"  [WARN] NaN/Inf loss at step {step + 1}, skipping update", rank)
+        # If ALL micro-steps were NaN, skip update but advance step counter
+        # so we try new data next iteration
+        if valid_micro == 0:
+            log(f"  [WARN] NaN/Inf loss on all {grad_accum} micro-steps at step {step + 1}, skipping", rank)
             optimizer.zero_grad(set_to_none=True)
-            accum_loss = 0.0
-            accum_count = 0
+            step += 1
             continue
 
         # LR schedule
